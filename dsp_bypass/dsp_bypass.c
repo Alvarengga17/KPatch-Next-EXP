@@ -26,7 +26,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("dsp_bypass");
-KPM_VERSION("1.0.5");
+KPM_VERSION("1.0.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("oMasko");
 KPM_DESCRIPTION("Dirty SELinux Bypass");
@@ -416,10 +416,19 @@ static void resolve_sids(void)
 
     logkd("dsp_bypass: cached %d targets, %d blocked ctx, %d pairs\n", n, bc, p);
 
-    /* In the state-passing era avc_ss_reset takes (avc, seqno); we'd
-     * have to guess the field offset, so skip it there. Stale 'allow'
-     * decisions age out of the AVC within seconds anyway. */
-    if (!has_state && fn_avc_reset) ((avc_reset_1_t)fn_avc_reset)(0);
+    /* Flush the AVC cache every time the filter is (re)applied.
+     * avc_ss_reset() belongs to the cache layer (avc.c), separate from
+     * the policy-database hooks that gained the struct selinux_state
+     * parameter in 5.0+, so its plain (seqno) signature is unaffected
+     * by has_state — calling it unconditionally is safe. Without this,
+     * a decision already cached as "allowed" from early boot (long
+     * before this module or its filter existed) is served straight
+     * from the cache on every later query and never reaches our
+     * compute_av_user hook at all, no matter how the filter is set. */
+    if (fn_avc_reset) {
+        int rc = ((avc_reset_1_t)fn_avc_reset)(0);
+        logkd("dsp_bypass: avc_ss_reset rc=%d\n", rc);
+    }
 }
 
 /* ---- hot path ---------------------------------------------------------- */
