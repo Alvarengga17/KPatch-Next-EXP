@@ -26,7 +26,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("dsp_bypass");
-KPM_VERSION("1.0.5");
+KPM_VERSION("1.0.7");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("oMasko");
 KPM_DESCRIPTION("Dirty SELinux Bypass");
@@ -113,6 +113,7 @@ typedef void (*kfree_t)(const void *);
 static void *fn_ctx_to_sid, *fn_avc_reset, *selinux_state_p;
 static void *fn_compute_av_user, *fn_load_policy;
 static void *fn_avc_denied;
+static void *fn_avc_has_perm_noaudit;
 static void *fn_slow_avc_audit;
 static get_cmdline_t fn_get_cmdline;
 static void *fn_sid_to_ctx;
@@ -446,6 +447,45 @@ static void diag_log_call(const char *where, uint32_t ssid, uint32_t tsid, int m
           current_uid(), comm ? comm : "<null>", got_domain ? domain : "<unresolved>", ssid, tsid, match, dirty);
 }
 
+/*
+ * PURE DIAGNOSTIC, READ-ONLY. This does not set skip_origin, does not
+ * touch f->ret, and does not write through any pointer — it only reads
+ * the register values hook_wrap already captured and logs them. It
+ * cannot alter kernel control flow or corrupt memory by itself, so it
+ * carries none of the risk a real patch here would. Goal: learn
+ * avc_has_perm_noaudit's actual argument layout on THIS kernel (which
+ * argument is ssid/tsid/tclass/avd and in what order) from real data
+ * before ever attempting to write through it.
+ */
+static void diag_avc_has_perm_noaudit(hook_fargs8_t *f, void *ud)
+{
+    uint32_t a0 = (uint32_t)f->arg0;
+    uint32_t a1 = (uint32_t)f->arg1;
+    uint32_t a2 = (uint32_t)f->arg2;
+    uint32_t a3 = (uint32_t)f->arg3;
+    uint32_t a4 = (uint32_t)f->arg4;
+    uint64_t a5 = (uint64_t)f->arg5;
+    int match;
+    int dirty_guess;
+    const char *comm;
+
+    if (!cache_ready) return;
+
+    match = current_matches_target();
+    /* a0/a1 are a guess at ssid/tsid; even if wrong, is_dirty_query is
+     * cheap and read-only, so a wrong guess here is harmless — it just
+     * means dirty_guess stays 0 and we rely on 'match' alone to decide
+     * whether to log. */
+    dirty_guess = is_dirty_query(a0, a1);
+
+    if (!match && !dirty_guess) return;
+
+    comm = get_task_comm(current);
+    logkd("dsp_bypass: DIAG avc_has_perm_noaudit a0=%u a1=%u a2=%u a3=%u a4=%u a5=%llx match=%d dirty_guess=%d "
+          "uid=%u comm=%s\n",
+          a0, a1, a2, a3, a4, (unsigned long long)a5, match, dirty_guess, current_uid(), comm ? comm : "<null>");
+}
+
 static int scrub(uint32_t ssid, uint32_t tsid, struct av_decision_compat *avd)
 {
     int match = current_matches_target();
@@ -547,6 +587,7 @@ static long dsp_init(const char *args, const char *event, void *__user reserved)
     fn_avc_reset = (void *)kallsyms_lookup_name("avc_ss_reset");
     fn_load_policy = (void *)kallsyms_lookup_name("security_load_policy");
     fn_avc_denied = (void *)kallsyms_lookup_name("avc_denied");
+    fn_avc_has_perm_noaudit = (void *)kallsyms_lookup_name("avc_has_perm_noaudit");
     fn_slow_avc_audit = (void *)kallsyms_lookup_name("slow_avc_audit");
     fn_get_cmdline = (get_cmdline_t)kallsyms_lookup_name("get_cmdline");
     if (!fn_load_policy) fn_load_policy = (void *)kallsyms_lookup_name("selinux_policy_load");
@@ -590,6 +631,15 @@ static long dsp_init(const char *args, const char *event, void *__user reserved)
         if (err_ctx) logkd("dsp_bypass: hook(avc_denied) failed: %d\n", err_ctx);
     }
 
+    /* Diagnostic-only, read-only post hook — see the function's own
+     * comment. Safe to leave attached even if it never fires. */
+    if (fn_avc_has_perm_noaudit) {
+        err_ctx = hook_wrap8(fn_avc_has_perm_noaudit, 0, diag_avc_has_perm_noaudit, 0);
+        logkd("dsp_bypass: hook(avc_has_perm_noaudit) %s\n", err_ctx ? "failed" : "ok");
+    } else {
+        logkd("dsp_bypass: avc_has_perm_noaudit symbol not found\n");
+    }
+
     if (fn_slow_avc_audit) {
         err_ctx = hook(fn_slow_avc_audit, (void *)slow_avc_audit_replace, (void **)&slow_avc_audit_backup);
         if (err_ctx) logkd("dsp_bypass: hook(slow_avc_audit) failed: %d\n", err_ctx);
@@ -615,6 +665,7 @@ static long dsp_exit(void *__user reserved)
     if (fn_compute_av_user) unhook(fn_compute_av_user);
     if (fn_ctx_to_sid) unhook(fn_ctx_to_sid);
     if (fn_avc_denied) unhook(fn_avc_denied);
+    if (fn_avc_has_perm_noaudit) unhook(fn_avc_has_perm_noaudit);
     if (fn_slow_avc_audit) unhook(fn_slow_avc_audit);
     if (fn_load_policy) unhook(fn_load_policy);
     return 0;
