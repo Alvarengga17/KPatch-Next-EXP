@@ -26,7 +26,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("dsp_bypass");
-KPM_VERSION("1.0.3");
+KPM_VERSION("1.0.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("oMasko");
 KPM_DESCRIPTION("Dirty SELinux Bypass");
@@ -251,13 +251,19 @@ static void log_target_hit(const char *reason, const char *detail)
  * We only compare the type prefix "u:r:app_zygote:s0" and ignore the MLS
  * category suffix (:c512,c768, ...), since that varies per instance.
  */
-static int current_task_is_app_zygote_domain(void)
+/* Resolve the CURRENT task's SID to its context string, copied into
+ * out (caller-owned, up to out_size-1 bytes). Returns 1 on success, 0
+ * if the symbols are missing or resolution failed for any reason. */
+static int resolve_current_domain_ctx(char *out, int out_size)
 {
     uint32_t secid = 0;
     char *ctx = 0;
     uint32_t ctx_len = 0;
     int ret;
-    int match = 0;
+    int ok = 0;
+
+    if (!out || out_size <= 1) return 0;
+    out[0] = '\0';
 
     if (!fn_getsecid || !fn_sid_to_ctx) return 0;
 
@@ -268,14 +274,27 @@ static int current_task_is_app_zygote_domain(void)
                       ((sid_to_ctx_4_t)fn_sid_to_ctx)(secid, &ctx, &ctx_len);
 
     if (ret == 0 && ctx) {
-        if (strncmp(ctx, "u:r:app_zygote:s0", 17) == 0) {
-            match = 1;
-            logkd("dsp_bypass: domain-match hit ctx=%s\n", ctx);
-        }
+        int n = (int)strlen(ctx);
+        if (n >= out_size) n = out_size - 1;
+        memcpy(out, ctx, n);
+        out[n] = '\0';
+        ok = 1;
         if (fn_kfree) fn_kfree(ctx);
     }
 
-    return match;
+    return ok;
+}
+
+static int current_task_is_app_zygote_domain(void)
+{
+    char ctx[160];
+
+    if (!resolve_current_domain_ctx(ctx, sizeof(ctx))) return 0;
+    if (strncmp(ctx, "u:r:app_zygote:s0", 17) == 0) {
+        logkd("dsp_bypass: domain-match hit ctx=%s\n", ctx);
+        return 1;
+    }
+    return 0;
 }
 
 static int current_matches_target(void)
@@ -405,11 +424,34 @@ static void resolve_sids(void)
 
 /* ---- hot path ---------------------------------------------------------- */
 
+static void diag_log_call(const char *where, uint32_t ssid, uint32_t tsid, int match, int dirty)
+{
+    char domain[160];
+    const char *comm;
+    int got_domain;
+
+    /* Only while a package/uid filter is actually configured, so we
+     * don't flood dmesg with every unrelated query on the system. Still
+     * logs on EVERY call reaching this point, match or not, so we can
+     * see whether the hook is even being reached during a probe. */
+    if (!targeting_enabled()) return;
+
+    got_domain = resolve_current_domain_ctx(domain, sizeof(domain));
+    comm = get_task_comm(current);
+    logkd("dsp_bypass: DIAG %s uid=%u comm=%s domain=%s ssid=%u tsid=%u match=%d dirty=%d\n", where,
+          current_uid(), comm ? comm : "<null>", got_domain ? domain : "<unresolved>", ssid, tsid, match, dirty);
+}
+
 static int scrub(uint32_t ssid, uint32_t tsid, struct av_decision_compat *avd)
 {
-    if (!current_matches_target()) return 0;
+    int match = current_matches_target();
+    int dirty = cache_ready ? is_dirty_query(ssid, tsid) : 0;
+
+    diag_log_call("compute_av_user", ssid, tsid, match, dirty);
+
+    if (!match) return 0;
     if (!cache_ready || !avd) return 0;
-    if (!is_dirty_query(ssid, tsid)) return 0;
+    if (!dirty) return 0;
 
     avd->allowed = avd->auditallow = 0;
     avd->auditdeny = ~0u;
@@ -424,10 +466,12 @@ static int slow_avc_audit_replace(void *_state, void *_ssid, void *_tsid, void *
     uint32_t tsid;
 
     if (!slow_avc_audit_backup) return 0;
-    if (!current_matches_target())
-        return slow_avc_audit_backup(_state, _ssid, _tsid, _tclass, _requested, _audited, _denied, _result, _a);
 
     decode_query_pair(_state, _ssid, _tsid, &ssid, &tsid);
+    diag_log_call("slow_avc_audit", ssid, tsid, current_matches_target(), cache_ready ? is_dirty_query(ssid, tsid) : 0);
+
+    if (!current_matches_target())
+        return slow_avc_audit_backup(_state, _ssid, _tsid, _tclass, _requested, _audited, _denied, _result, _a);
 
     if (is_dirty_query(ssid, tsid)) {
         log_target_hit("suppressed slow_avc_audit", "matched dirty policy target");
@@ -445,10 +489,13 @@ static int avc_denied_replace(void *_state, void *_ssid, void *_tsid, void *_tcl
     struct av_decision_compat *avd;
 
     if (!avc_denied_backup) return 0;
+
+    decode_query_pair(_state, _ssid, _tsid, &ssid, &tsid);
+    diag_log_call("avc_denied", ssid, tsid, current_matches_target(), cache_ready ? is_dirty_query(ssid, tsid) : 0);
+
     if (!current_matches_target())
         return avc_denied_backup(_state, _ssid, _tsid, _tclass, _requested, _driver, _xperm, _flags);
 
-    decode_query_pair(_state, _ssid, _tsid, &ssid, &tsid);
     if (!is_dirty_query(ssid, tsid))
         return avc_denied_backup(_state, _ssid, _tsid, _tclass, _requested, _driver, _xperm, _flags);
 
