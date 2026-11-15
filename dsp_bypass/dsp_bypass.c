@@ -26,7 +26,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("dsp_bypass");
-KPM_VERSION("1.0.2");
+KPM_VERSION("1.0.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("oMasko");
 KPM_DESCRIPTION("Dirty SELinux Bypass");
@@ -268,7 +268,10 @@ static int current_task_is_app_zygote_domain(void)
                       ((sid_to_ctx_4_t)fn_sid_to_ctx)(secid, &ctx, &ctx_len);
 
     if (ret == 0 && ctx) {
-        if (strncmp(ctx, "u:r:app_zygote:s0", 18) == 0) match = 1;
+        if (strncmp(ctx, "u:r:app_zygote:s0", 17) == 0) {
+            match = 1;
+            logkd("dsp_bypass: domain-match hit ctx=%s\n", ctx);
+        }
         if (fn_kfree) fn_kfree(ctx);
     }
 
