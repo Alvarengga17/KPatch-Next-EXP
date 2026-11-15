@@ -1,0 +1,46 @@
+name: Build dsp_bypass.kpm
+
+on:
+  workflow_dispatch:
+
+env:
+  ARM_TOOLCHAIN_VERSION: "12.2.rel1"
+  ARM_TOOLCHAIN_TARGET: "aarch64-none-elf"
+
+jobs:
+  build-kpm:
+    name: Build dsp_bypass.kpm
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: ⏰ Checkout repository
+        uses: actions/checkout@v6
+
+      - name: ⌛️ Download ARM GNU Toolchain (aarch64-none-elf)
+        run: |
+          TOOLCHAIN_FILE="arm-gnu-toolchain-${ARM_TOOLCHAIN_VERSION}-x86_64-${ARM_TOOLCHAIN_TARGET}.tar.xz"
+          TOOLCHAIN_URL="https://developer.arm.com/-/media/Files/downloads/gnu/${ARM_TOOLCHAIN_VERSION}/binrel/${TOOLCHAIN_FILE}"
+          wget -q "$TOOLCHAIN_URL" -O "$TOOLCHAIN_FILE"
+          mkdir -p "$HOME/toolchain"
+          tar -xf "$TOOLCHAIN_FILE" -C "$HOME/toolchain"
+          echo "$HOME/toolchain/arm-gnu-toolchain-${ARM_TOOLCHAIN_VERSION}-x86_64-${ARM_TOOLCHAIN_TARGET}/bin" >> "$GITHUB_PATH"
+
+      - name: 🔍 Verify toolchain
+        run: aarch64-none-elf-gcc --version
+
+      - name: 📁 Place dsp_bypass module sources
+        run: |
+          mkdir -p kpms/dsp_bypass
+          cp dsp_bypass/dsp_bypass.c kpms/dsp_bypass/dsp_bypass.c
+          cp dsp_bypass/Makefile kpms/dsp_bypass/Makefile
+
+      - name: 🚀 Build dsp_bypass.kpm
+        working-directory: kpms/dsp_bypass
+        run: make TARGET_COMPILE=aarch64-none-elf-
+
+      - name: ✏️ Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsp_bypass-kpm
+          path: kpms/dsp_bypass/dsp_bypass.kpm
+          if-no-files-found: error
