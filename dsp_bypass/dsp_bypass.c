@@ -26,7 +26,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("dsp_bypass");
-KPM_VERSION("1.0.1");
+KPM_VERSION("1.0.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("oMasko");
 KPM_DESCRIPTION("Dirty SELinux Bypass");
@@ -73,6 +73,7 @@ static const struct
                         { "u:r:system_server:s0", "u:r:system_server:s0" }, /* execmem neverallow */
                         { "u:r:fsck_untrusted:s0", "u:r:fsck_untrusted:s0" }, /* sys_admin neverallow */
                         { "u:r:untrusted_app:s0", "u:object_r:lsposed_file:s0" }, /* LSPosed dirty policy */
+                        { "u:r:adbd:s0", "u:r:adbroot:s0" }, /* adb root binder probe */
                         { "u:r:app_zygote:s0", "u:object_r:ksu_file:s0" }, /* Oracle carrier -> root obj */
                         { "u:r:app_zygote:s0", "u:object_r:magisk_file:s0" }, /* Oracle carrier -> root obj */
                         { "u:r:app_zygote:s0:c512,c768", "u:object_r:ksu_file:s0" },
@@ -97,6 +98,13 @@ typedef int (*ctx_to_sid_5_t)(void *, const char *, uint32_t, uint32_t *, gfp_t)
 typedef int (*avc_reset_1_t)(uint32_t);
 typedef int (*get_cmdline_t)(struct task_struct *, char *, int);
 
+/* reverse direction: SID -> context string, used to read the CURRENT
+ * task's actual SELinux domain rather than trust its process name. */
+typedef int (*sid_to_ctx_4_t)(uint32_t, char **, uint32_t *);
+typedef int (*sid_to_ctx_5_t)(void *, uint32_t, char **, uint32_t *);
+typedef void (*getsecid_t)(struct task_struct *, uint32_t *);
+typedef void (*kfree_t)(const void *);
+
 /* ---- module state ------------------------------------------------------ */
 
 #define MAX_TARGETS 64
@@ -107,6 +115,9 @@ static void *fn_compute_av_user, *fn_load_policy;
 static void *fn_avc_denied;
 static void *fn_slow_avc_audit;
 static get_cmdline_t fn_get_cmdline;
+static void *fn_sid_to_ctx;
+static getsecid_t fn_getsecid;
+static kfree_t fn_kfree;
 static int has_state;
 static int (*avc_denied_backup)(void *, void *, void *, void *, void *, void *, void *, void *) = 0;
 static int (*slow_avc_audit_backup)(void *, void *, void *, void *, void *, void *, void *, void *, void *) = 0;
@@ -186,6 +197,7 @@ static void log_filters(void)
     if (uid_filter_enabled) logkd("dsp_bypass: uid filter=%u\n", target_uid);
     if (package_filter_enabled) logkd("dsp_bypass: package filter=%s\n", target_package);
     if (!targeting_enabled()) logkd("dsp_bypass: no target filter configured; bypass stays inactive\n");
+    logkd("dsp_bypass: domain-match ready=%s\n", (fn_getsecid && fn_sid_to_ctx) ? "yes" : "no (comm/cmdline only)");
 }
 
 static void apply_filters_from_args(const char *args)
@@ -229,6 +241,40 @@ static void log_target_hit(const char *reason, const char *detail)
           cmdline[0] ? cmdline : "<none>", detail ? detail : "<none>");
 }
 
+/*
+ * Resolve the CURRENT task's actual SELinux domain (via its SID) and
+ * check whether its TYPE component is "app_zygote". This is the signal
+ * Duck Detector itself relies on ("dedicated app_zygote carrier") and is
+ * far more reliable than comm/cmdline: a probe process can rename itself
+ * (Process.setArgV0) before running the probe, but it cannot change the
+ * SELinux domain it was forked into without an actual domain transition.
+ * We only compare the type prefix "u:r:app_zygote:s0" and ignore the MLS
+ * category suffix (:c512,c768, ...), since that varies per instance.
+ */
+static int current_task_is_app_zygote_domain(void)
+{
+    uint32_t secid = 0;
+    char *ctx = 0;
+    uint32_t ctx_len = 0;
+    int ret;
+    int match = 0;
+
+    if (!fn_getsecid || !fn_sid_to_ctx) return 0;
+
+    fn_getsecid(current, &secid);
+    if (!secid) return 0;
+
+    ret = has_state ? ((sid_to_ctx_5_t)fn_sid_to_ctx)(selinux_state_p, secid, &ctx, &ctx_len) :
+                      ((sid_to_ctx_4_t)fn_sid_to_ctx)(secid, &ctx, &ctx_len);
+
+    if (ret == 0 && ctx) {
+        if (strncmp(ctx, "u:r:app_zygote:s0", 18) == 0) match = 1;
+        if (fn_kfree) fn_kfree(ctx);
+    }
+
+    return match;
+}
+
 static int current_matches_target(void)
 {
     char cmdline[128];
@@ -240,13 +286,13 @@ static int current_matches_target(void)
     if (uid_filter_enabled && current_uid() != target_uid) return 0;
     if (!package_filter_enabled) return 1;
 
+    /* Strongest signal first: the task's actual SELinux domain, not its
+     * (possibly renamed) process name. */
+    if (current_task_is_app_zygote_domain()) return 1;
+
     comm = get_task_comm(current);
 
-    /* Patch: root-detection probes are often run inside app_zygote,
-     * BEFORE the process specializes into the target package — at that
-     * point comm/cmdline still read "app_zygote", not the package name,
-     * so the plain name match below would never fire. Treat any
-     * app_zygote process as a match while targeting is enabled. */
+    /* Fallback for probes that don't rename themselves at all. */
     if (comm && strcmp(comm, "app_zygote") == 0) return 1;
 
     if (fn_get_cmdline) {
@@ -450,6 +496,16 @@ static long dsp_init(const char *args, const char *event, void *__user reserved)
     fn_slow_avc_audit = (void *)kallsyms_lookup_name("slow_avc_audit");
     fn_get_cmdline = (get_cmdline_t)kallsyms_lookup_name("get_cmdline");
     if (!fn_load_policy) fn_load_policy = (void *)kallsyms_lookup_name("selinux_policy_load");
+
+    /* Domain-based matching: best-effort, several possible symbol names
+     * depending on kernel version. Missing any of these just falls back
+     * to comm/cmdline matching, it isn't fatal. */
+    fn_getsecid = (getsecid_t)kallsyms_lookup_name("security_task_getsecid_subj");
+    if (!fn_getsecid) fn_getsecid = (getsecid_t)kallsyms_lookup_name("security_task_getsecid_obj");
+    if (!fn_getsecid) fn_getsecid = (getsecid_t)kallsyms_lookup_name("security_task_getsecid");
+    fn_sid_to_ctx = (void *)kallsyms_lookup_name("security_sid_to_context");
+    if (!fn_sid_to_ctx) fn_sid_to_ctx = (void *)kallsyms_lookup_name("security_sid_to_context_force");
+    fn_kfree = (kfree_t)kallsyms_lookup_name("kfree");
 
     apply_filters_from_args(args);
 
