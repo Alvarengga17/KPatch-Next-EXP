@@ -26,7 +26,7 @@
 #include <uapi/asm-generic/errno.h>
 
 KPM_NAME("dsp_bypass");
-KPM_VERSION("1.0.4");
+KPM_VERSION("1.0.5");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("oMasko");
 KPM_DESCRIPTION("Dirty SELinux Bypass");
@@ -430,11 +430,15 @@ static void diag_log_call(const char *where, uint32_t ssid, uint32_t tsid, int m
     const char *comm;
     int got_domain;
 
-    /* Only while a package/uid filter is actually configured, so we
-     * don't flood dmesg with every unrelated query on the system. Still
-     * logs on EVERY call reaching this point, match or not, so we can
-     * see whether the hook is even being reached during a probe. */
-    if (!targeting_enabled()) return;
+    /* Log only calls that are actually relevant: either our own
+     * matching logic already says yes, OR the query itself touches a
+     * dirty target SID (adbroot/ksu/magisk/...) regardless of who is
+     * asking. This is what lets us catch the real probe even when
+     * current_matches_target() is wrong about the caller, while cutting
+     * out the heavy background noise from servicemanager,
+     * hwservicemanager, keystore, etc., which never touch these SIDs at
+     * all and would otherwise bury the one line that matters. */
+    if (!match && !dirty) return;
 
     got_domain = resolve_current_domain_ctx(domain, sizeof(domain));
     comm = get_task_comm(current);
